@@ -37,6 +37,7 @@
 const auto IMAGE_POOL_CLEANUP_INTERVAL = std::chrono::minutes(1);
 // Duration since last usage of Image pixmap before expiration of frames
 const auto IMAGE_POOL_IMAGE_LIFETIME = std::chrono::minutes(10);
+const auto IMAGE_LAYOUT_THROTTLE = std::chrono::milliseconds(100);
 
 namespace chatterino::detail {
 
@@ -312,27 +313,17 @@ void assignFrames(std::weak_ptr<Image> weak, QList<Frame> parsed)
         }
         shared->frames_ = std::make_unique<detail::Frames>(std::move(parsed));
 
-        // Avoid too many layouts in one event-loop iteration
-        //
-        // This callback is called for every image, so there might be multiple
-        // callbacks queued on the event-loop in this iteration, but we only
-        // want to generate one invalidation.
         if (!isPushQueued)
         {
             isPushQueued = true;
-            // We don't use postToThread here, because that would run immediately.
-            // We explicitly want to queue a callback after the current ones.
-            QMetaObject::invokeMethod(
-                qApp,
-                [] {
-                    isPushQueued = false;
-                    auto *app = tryGetApp();
-                    if (app != nullptr)
-                    {
-                        app->getWindows()->forceLayoutChannelViews();
-                    }
-                },
-                Qt::QueuedConnection);
+            QTimer::singleShot(IMAGE_LAYOUT_THROTTLE, qApp, [] {
+                isPushQueued = false;
+                auto *app = tryGetApp();
+                if (app != nullptr)
+                {
+                    app->getWindows()->forceLayoutChannelViews();
+                }
+            });
         }
     };
 
