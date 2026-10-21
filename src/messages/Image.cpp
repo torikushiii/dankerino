@@ -24,8 +24,11 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QThread>
+#include <QThreadPool>
 #include <QTimer>
 
+#include <algorithm>
 #include <atomic>
 #include <numeric>
 #include <utility>
@@ -340,6 +343,23 @@ void assignFrames(std::weak_ptr<Image> weak, QList<Frame> parsed)
 
 namespace chatterino {
 
+namespace {
+
+constexpr qsizetype SMALL_IMAGE_BYTES = 64 * 1024;
+
+QThreadPool *imageDecodePool()
+{
+    static auto *pool = [] {
+        auto *p = new QThreadPool;
+        p->setObjectName("ImageDecode");
+        p->setMaxThreadCount(std::max(2, QThread::idealThreadCount() - 1));
+        return p;
+    }();
+    return pool;
+}
+
+}  // namespace
+
 // IMAGE2
 Image::~Image()
 {
@@ -606,57 +626,68 @@ void Image::actuallyLoad()
         .concurrent()
         .cache()
         .onSuccess([weak](auto result) {
-            auto shared = weak.lock();
-            if (!shared)
-            {
-                return;
-            }
+            const auto &data = result.getData();
+            int priority = data.size() <= SMALL_IMAGE_BYTES ? 1 : 0;
 
-            assert(!isAppAboutToQuit());
+            imageDecodePool()->start(
+                [weak, data] {
+                    if (isAppAboutToQuit())
+                    {
+                        return;
+                    }
 
-            QBuffer buffer;
-            buffer.setData(result.getData());
-            QImageReader reader(&buffer);
+                    auto shared = weak.lock();
+                    if (!shared)
+                    {
+                        return;
+                    }
 
-            if (!reader.canRead())
-            {
-                qCDebug(chatterinoImage)
-                    << "Error: image cant be read " << shared->url().string;
-                shared->empty_ = true;
-                return;
-            }
+                    QBuffer buffer;
+                    buffer.setData(data);
+                    QImageReader reader(&buffer);
 
-            const auto size = reader.size();
-            if (size.isEmpty())
-            {
-                shared->empty_ = true;
-                return;
-            }
+                    if (!reader.canRead())
+                    {
+                        qCDebug(chatterinoImage) << "Error: image cant be read "
+                                                 << shared->url().string;
+                        shared->empty_ = true;
+                        return;
+                    }
 
-            // returns 1 for non-animated formats
-            if (reader.imageCount() <= 0)
-            {
-                qCDebug(chatterinoImage)
-                    << "Error: image has less than 1 frame "
-                    << shared->url().string << ": " << reader.errorString();
-                shared->empty_ = true;
-                return;
-            }
+                    const auto size = reader.size();
+                    if (size.isEmpty())
+                    {
+                        shared->empty_ = true;
+                        return;
+                    }
 
-            // use "double" to prevent int overflows
-            if (double(size.width()) * double(size.height()) *
-                    double(reader.imageCount()) * 4.0 >
-                double(Image::maxBytesRam))
-            {
-                qCDebug(chatterinoImage) << "image too large in RAM";
+                    // returns 1 for non-animated formats
+                    if (reader.imageCount() <= 0)
+                    {
+                        qCDebug(chatterinoImage)
+                            << "Error: image has less than 1 frame "
+                            << shared->url().string << ": "
+                            << reader.errorString();
+                        shared->empty_ = true;
+                        return;
+                    }
 
-                shared->empty_ = true;
-                return;
-            }
+                    // use "double" to prevent int overflows
+                    if (double(size.width()) * double(size.height()) *
+                            double(reader.imageCount()) * 4.0 >
+                        double(Image::maxBytesRam))
+                    {
+                        qCDebug(chatterinoImage) << "image too large in RAM";
 
-            auto parsed = detail::readFrames(reader, shared->url());
+                        shared->empty_ = true;
+                        return;
+                    }
 
-            assignFrames(shared, parsed);
+                    auto parsed = detail::readFrames(reader, shared->url());
+
+                    assignFrames(shared, parsed);
+                },
+                priority);
         })
         .onError([weak](auto /*result*/) {
             auto shared = weak.lock();
